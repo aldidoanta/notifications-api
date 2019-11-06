@@ -871,3 +871,36 @@ def test_post_notification_returns_400_when_get_json_throws_exception(client, sa
         data="[",
         headers=[('Content-Type', 'application/json'), auth_header])
     assert response.status_code == 400
+
+
+def test_post_email_notification_without_content_type_header_returns_400(
+        client, sample_service, mocker):
+    auth_header = create_authorization_header(service_id=sample_service.id)
+    data = {
+        "email_address": sample_service.users[0].email_address,
+        "template_id": str(uuid.uuid4()),
+    }
+    response = client.post(
+        path='/v2/notifications/email',
+        data=json.dumps(data),
+        headers=[auth_header],
+    )
+
+    error_msg = json.loads(response.get_data(as_text=True))["errors"][0]["message"]
+
+    assert response.status_code == 400
+    assert error_msg == 'Request body is empty or Content-Type header is not set to application/json.'
+
+
+def test_post_email_notification_when_data_is_empty_returns_400(
+        client, sample_service, mocker):
+    auth_header = create_authorization_header(service_id=sample_service.id)
+    data = None
+    response = client.post(
+        path='/v2/notifications/email',
+        data=json.dumps(data),
+        headers=[('Content-Type', 'application/json'), auth_header],
+    )
+    error_msg = json.loads(response.get_data(as_text=True))["errors"][0]["message"]
+    assert response.status_code == 400
+    assert error_msg == 'Request body is empty or Content-Type header is not set to application/json.'

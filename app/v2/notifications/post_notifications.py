@@ -101,8 +101,8 @@ def post_precompiled_letter_notification():
 def post_notification(notification_type):
     try:
         request_json = request.get_json()
-    except BadRequest as e:
-        raise BadRequestError(message="Error decoding arguments: {}".format(e.description),
+    except BadRequest:
+        raise BadRequestError(message="Invalid JSON supplied in POST data",
                               status_code=400)
 
     if notification_type == EMAIL_TYPE:
