@@ -32,7 +32,8 @@ make generate-version-file
 pip3 install -r requirements_for_test.txt
 
 # Create Postgres databases
-createdb notification_api
+export PGPASSWORD=123456
+createdb -h 127.0.0.1 -p 5432 -U user notification_api
 
 # Upgrade databases
 source environment.sh

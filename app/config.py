@@ -114,7 +114,7 @@ class Config(object):
 
     NOTIFY_ENVIRONMENT = 'development'
     ADMIN_CLIENT_USER_NAME = 'notify-admin'
-    AWS_REGION = 'eu-west-1'
+    AWS_REGION = 'ap-southeast-1'
     INVITATION_EXPIRATION_DAYS = 2
     NOTIFY_APP_NAME = 'api'
     SQLALCHEMY_RECORD_QUERIES = False
