@@ -1,5 +1,7 @@
 import functools
 import string
+from itertools import groupby
+from operator import attrgetter
 from datetime import (
     datetime,
     timedelta,
@@ -15,7 +17,7 @@ from notifications_utils.recipients import (
 )
 from notifications_utils.statsd_decorators import statsd
 from notifications_utils.timezones import convert_bst_to_utc, convert_utc_to_bst
-from sqlalchemy import (desc, func, asc)
+from sqlalchemy import (desc, func, asc, and_)
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.sql import functions
@@ -31,7 +33,9 @@ from app.letters.utils import get_letter_pdf_filename
 from app.models import (
     Notification,
     NotificationHistory,
+    ProviderDetails,
     ScheduledNotification,
+    KEY_TYPE_NORMAL,
     KEY_TYPE_TEST,
     LETTER_TYPE,
     NOTIFICATION_CREATED,
@@ -46,7 +50,7 @@ from app.models import (
     SMS_TYPE,
     EMAIL_TYPE,
     ServiceDataRetention,
-    Service
+    Service,
 )
 from app.utils import get_london_midnight_in_utc
 from app.utils import midnight_n_days_ago, escape_special_characters
@@ -485,40 +489,61 @@ def dao_timeout_notifications(timeout_period_in_seconds):
     return technical_failure_notifications, temporary_failure_notifications
 
 
-def is_delivery_slow_for_provider(
+def is_delivery_slow_for_providers(
         created_at,
-        provider,
         threshold,
         delivery_time,
 ):
-    count = db.session.query(
+    """
+    Returns a dict of providers and whether they are currently slow or not. eg:
+    {
+        'mmg': True,
+        'firetext': False
+    }
+    """
+    slow_notification_counts = db.session.query(
+        ProviderDetails.identifier,
         case(
             [(
                 Notification.status == NOTIFICATION_DELIVERED,
                 (Notification.updated_at - Notification.sent_at) >= delivery_time
             )],
             else_=(datetime.utcnow() - Notification.sent_at) >= delivery_time
-        ).label("slow"), func.count()
-
+        ).label("slow"),
+        func.count().label('count')
+    ).select_from(
+        ProviderDetails
+    ).outerjoin(
+        Notification, and_(
+            Notification.sent_by == ProviderDetails.identifier,
+            Notification.created_at >= created_at,
+            Notification.sent_at.isnot(None),
+            Notification.status.in_([NOTIFICATION_DELIVERED, NOTIFICATION_PENDING, NOTIFICATION_SENDING]),
+            Notification.key_type != KEY_TYPE_TEST
+        )
     ).filter(
-        Notification.created_at >= created_at,
-        Notification.sent_at.isnot(None),
-        Notification.status.in_([NOTIFICATION_DELIVERED, NOTIFICATION_PENDING, NOTIFICATION_SENDING]),
-        Notification.sent_by == provider,
-        Notification.key_type != KEY_TYPE_TEST
-    ).group_by("slow").all()
+        ProviderDetails.notification_type == 'sms',
+        ProviderDetails.active
+    ).order_by(
+        ProviderDetails.identifier
+    ).group_by(
+        ProviderDetails.identifier,
+        "slow"
+    )
 
-    counts = {c[0]: c[1] for c in count}
-    total_notifications = sum(counts.values())
-    slow_notifications = counts.get(True, 0)
+    slow_providers = {}
+    for provider, rows in groupby(slow_notification_counts, key=attrgetter('identifier')):
+        rows = list(rows)
+        total_notifications = sum(row.count for row in rows)
+        slow_notifications = sum(row.count for row in rows if row.slow)
 
-    if total_notifications:
+        slow_providers[provider] = (slow_notifications / total_notifications >= threshold)
+
         current_app.logger.info("Slow delivery notifications count for provider {}: {} out of {}. Ratio {}".format(
             provider, slow_notifications, total_notifications, slow_notifications / total_notifications
         ))
-        return slow_notifications / total_notifications >= threshold
-    else:
-        return False
+
+    return slow_providers
 
 
 @statsd(namespace="dao")
@@ -698,12 +723,29 @@ def dao_old_letters_with_created_status():
     last_processing_deadline = yesterday_bst.replace(hour=17, minute=30, second=0, microsecond=0)
 
     notifications = Notification.query.filter(
-        Notification.updated_at < convert_bst_to_utc(last_processing_deadline),
+        Notification.created_at < convert_bst_to_utc(last_processing_deadline),
         Notification.notification_type == LETTER_TYPE,
         Notification.status == NOTIFICATION_CREATED
     ).order_by(
-        Notification.updated_at
+        Notification.created_at
     ).all()
+    return notifications
+
+
+def letters_missing_from_sending_bucket(seconds_to_subtract):
+    older_than_date = datetime.utcnow() - timedelta(seconds=seconds_to_subtract)
+    # We expect letters to have a `created` status, updated_at timestamp and billable units greater than zero.
+    notifications = Notification.query.filter(
+        Notification.billable_units == 0,
+        Notification.updated_at == None,  # noqa
+        Notification.status == NOTIFICATION_CREATED,
+        Notification.created_at <= older_than_date,
+        Notification.notification_type == LETTER_TYPE,
+        Notification.key_type == KEY_TYPE_NORMAL
+    ).order_by(
+        Notification.created_at
+    ).all()
+
     return notifications
 
 

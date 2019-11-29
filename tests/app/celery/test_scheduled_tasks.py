@@ -5,7 +5,6 @@ import pytest
 from freezegun import freeze_time
 from mock import mock
 
-from app import db
 from app.celery import scheduled_tasks
 from app.celery.scheduled_tasks import (
     check_job_status,
@@ -13,19 +12,16 @@ from app.celery.scheduled_tasks import (
     delete_verify_codes,
     run_scheduled_jobs,
     send_scheduled_notifications,
-    switch_current_sms_provider_on_slow_delivery,
     replay_created_notifications,
     check_precompiled_letter_state,
     check_templated_letter_state,
-    check_for_missing_rows_in_completed_jobs
+    check_for_missing_rows_in_completed_jobs,
+    switch_current_sms_provider_on_slow_delivery,
 )
 from app.config import QueueNames, TaskNames
 from app.dao.jobs_dao import dao_get_job_by_id
 from app.dao.notifications_dao import dao_get_scheduled_notifications
-from app.dao.provider_details_dao import (
-    dao_update_provider_details,
-    get_current_provider
-)
+from app.dao.provider_details_dao import get_provider_details_by_identifier
 from app.models import (
     JOB_STATUS_IN_PROGRESS,
     JOB_STATUS_ERROR,
@@ -56,21 +52,13 @@ def _create_slow_delivery_notification(template, provider='mmg'):
     )
 
 
-@pytest.fixture(scope='function')
-def prepare_current_provider(restore_provider_details):
-    initial_provider = get_current_provider('sms')
-    dao_update_provider_details(initial_provider)
-    initial_provider.updated_at = datetime.utcnow() - timedelta(minutes=30)
-    db.session.commit()
-
-
 def test_should_call_delete_codes_on_delete_verify_codes_task(notify_db_session, mocker):
     mocker.patch('app.celery.scheduled_tasks.delete_codes_older_created_more_than_a_day_ago')
     delete_verify_codes()
     assert scheduled_tasks.delete_codes_older_created_more_than_a_day_ago.call_count == 1
 
 
-def test_should_call_delete_invotations_on_delete_invitations_task(notify_api, mocker):
+def test_should_call_delete_invotations_on_delete_invitations_task(notify_db_session, mocker):
     mocker.patch('app.celery.scheduled_tasks.delete_invitations_created_more_than_two_days_ago')
     delete_invitations()
     assert scheduled_tasks.delete_invitations_created_more_than_two_days_ago.call_count == 1
@@ -112,31 +100,45 @@ def test_should_update_all_scheduled_jobs_and_put_on_queue(sample_template, mock
     ])
 
 
-def test_switch_providers_on_slow_delivery_switches_once_then_does_not_switch_if_already_switched(
-        notify_api,
-        mocker,
-        prepare_current_provider,
-        sample_user,
-        sample_template
+@freeze_time('2017-05-01 14:00:00')
+def test_switch_current_sms_provider_on_slow_delivery_switches_when_one_provider_is_slow(
+    mocker,
+    restore_provider_details,
 ):
-    mocker.patch('app.provider_details.switch_providers.get_user_by_id', return_value=sample_user)
-    starting_provider = get_current_provider('sms')
-
-    _create_slow_delivery_notification(sample_template)
-    _create_slow_delivery_notification(sample_template)
+    is_slow_dict = {'mmg': False, 'firetext': True}
+    mock_is_slow = mocker.patch('app.celery.scheduled_tasks.is_delivery_slow_for_providers', return_value=is_slow_dict)
+    mock_reduce = mocker.patch('app.celery.scheduled_tasks.dao_reduce_sms_provider_priority')
+    # updated_at times are older than the 10 minute window
+    get_provider_details_by_identifier('mmg').updated_at = datetime(2017, 5, 1, 13, 49)
+    get_provider_details_by_identifier('firetext').updated_at = None
 
     switch_current_sms_provider_on_slow_delivery()
 
-    new_provider = get_current_provider('sms')
-    _create_slow_delivery_notification(sample_template, new_provider.identifier)
-    _create_slow_delivery_notification(sample_template, new_provider.identifier)
+    mock_is_slow.assert_called_once_with(
+        threshold=0.3,
+        created_at=datetime(2017, 5, 1, 13, 50),
+        delivery_time=timedelta(minutes=4)
+    )
+    mock_reduce.assert_called_once_with('firetext', time_threshold=timedelta(minutes=10))
+
+
+@freeze_time('2017-05-01 14:00:00')
+@pytest.mark.parametrize('is_slow_dict', [
+    {'mmg': False, 'firetext': False},
+    {'mmg': True, 'firetext': True},
+])
+def test_switch_current_sms_provider_on_slow_delivery_does_nothing_if_no_need(
+    mocker,
+    restore_provider_details,
+    is_slow_dict
+):
+    mocker.patch('app.celery.scheduled_tasks.is_delivery_slow_for_providers', return_value=is_slow_dict)
+    mock_reduce = mocker.patch('app.celery.scheduled_tasks.dao_reduce_sms_provider_priority')
+    get_provider_details_by_identifier('mmg').updated_at = datetime(2017, 5, 1, 13, 51)
+
     switch_current_sms_provider_on_slow_delivery()
 
-    final_provider = get_current_provider('sms')
-
-    assert new_provider.identifier != starting_provider.identifier
-    assert new_provider.priority < starting_provider.priority
-    assert final_provider.identifier == new_provider.identifier
+    assert mock_reduce.called is False
 
 
 @freeze_time("2017-05-01 14:00:00")
@@ -285,7 +287,7 @@ def test_replay_created_notifications(notify_db_session, sample_service, mocker)
 
     sms_template = create_template(service=sample_service, template_type='sms')
     email_template = create_template(service=sample_service, template_type='email')
-    older_than = (60 * 60 * 4) + (60 * 15)  # 4 hours 15 minutes
+    older_than = (60 * 60) + (60 * 15)  # 1 hour 15 minutes
     # notifications expected to be resent
     old_sms = create_notification(template=sms_template, created_at=datetime.utcnow() - timedelta(seconds=older_than),
                                   status='created')
@@ -307,6 +309,28 @@ def test_replay_created_notifications(notify_db_session, sample_service, mocker)
                                                  queue='send-email-tasks')
     sms_delivery_queue.assert_called_once_with([str(old_sms.id)],
                                                queue="send-sms-tasks")
+
+
+def test_replay_created_notifications_create_letters_pdf_tasks_for_letters_not_ready_to_send(
+        sample_letter_template, mocker
+):
+    mock_task = mocker.patch('app.celery.scheduled_tasks.create_letters_pdf.apply_async')
+    create_notification(template=sample_letter_template, billable_units=0,
+                        created_at=datetime.utcnow() - timedelta(hours=4))
+
+    create_notification(template=sample_letter_template, billable_units=0,
+                        created_at=datetime.utcnow() - timedelta(minutes=20))
+    notification_1 = create_notification(template=sample_letter_template, billable_units=0,
+                                         created_at=datetime.utcnow() - timedelta(hours=1, minutes=20))
+    notification_2 = create_notification(template=sample_letter_template, billable_units=0,
+                                         created_at=datetime.utcnow() - timedelta(hours=5))
+
+    replay_created_notifications()
+
+    calls = [call([notification_1.id], queue=QueueNames.LETTERS),
+             call([notification_2.id], queue=QueueNames.LETTERS),
+             ]
+    mock_task.assert_has_calls(calls, any_order=True)
 
 
 def test_check_job_status_task_does_not_raise_error(sample_template):
@@ -363,12 +387,12 @@ def test_check_templated_letter_state_during_bst(mocker, sample_letter_template)
     mock_logger = mocker.patch('app.celery.tasks.current_app.logger.exception')
     mock_create_ticket = mocker.patch('app.celery.nightly_tasks.zendesk_client.create_ticket')
 
-    noti_1 = create_notification(template=sample_letter_template, updated_at=datetime(2019, 5, 1, 12, 0))
-    noti_2 = create_notification(template=sample_letter_template, updated_at=datetime(2019, 5, 29, 16, 29))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 5, 29, 16, 30))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 5, 29, 17, 29))
-    create_notification(template=sample_letter_template, status='delivered', updated_at=datetime(2019, 5, 28, 10, 0))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 5, 30, 10, 0))
+    noti_1 = create_notification(template=sample_letter_template, created_at=datetime(2019, 5, 1, 12, 0))
+    noti_2 = create_notification(template=sample_letter_template, created_at=datetime(2019, 5, 29, 16, 29))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 5, 29, 16, 30))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 5, 29, 17, 29))
+    create_notification(template=sample_letter_template, status='delivered', created_at=datetime(2019, 5, 28, 10, 0))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 5, 30, 10, 0))
 
     check_templated_letter_state()
 
@@ -386,14 +410,14 @@ def test_check_templated_letter_state_during_bst(mocker, sample_letter_template)
 @freeze_time("2019-01-30 14:00:00")
 def test_check_templated_letter_state_during_utc(mocker, sample_letter_template):
     mock_logger = mocker.patch('app.celery.tasks.current_app.logger.exception')
-    mock_create_ticket = mocker.patch('app.celery.nightly_tasks.zendesk_client.create_ticket')
+    mock_create_ticket = mocker.patch('app.celery.scheduled_tasks.zendesk_client.create_ticket')
 
-    noti_1 = create_notification(template=sample_letter_template, updated_at=datetime(2018, 12, 1, 12, 0))
-    noti_2 = create_notification(template=sample_letter_template, updated_at=datetime(2019, 1, 29, 17, 29))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 1, 29, 17, 30))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 1, 29, 18, 29))
-    create_notification(template=sample_letter_template, status='delivered', updated_at=datetime(2019, 1, 29, 10, 0))
-    create_notification(template=sample_letter_template, updated_at=datetime(2019, 1, 30, 10, 0))
+    noti_1 = create_notification(template=sample_letter_template, created_at=datetime(2018, 12, 1, 12, 0))
+    noti_2 = create_notification(template=sample_letter_template, created_at=datetime(2019, 1, 29, 17, 29))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 1, 29, 17, 30))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 1, 29, 18, 29))
+    create_notification(template=sample_letter_template, status='delivered', created_at=datetime(2019, 1, 29, 10, 0))
+    create_notification(template=sample_letter_template, created_at=datetime(2019, 1, 30, 10, 0))
 
     check_templated_letter_state()
 
